@@ -1,0 +1,35 @@
+# Data files (too large for git)
+data/raw/*.csv
+data/raw/*.json
+data/processed/*.csv
+data/processed/*.parquet
+
+# R
+.Rhistory
+.Rdata
+.Rproj.user/
+*.Rproj
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs (regenerable)
+outputs/*.png
+outputs/*.pdf
+
+# Credentials
+*.credentials
+*.secret
+config/secrets.yaml
