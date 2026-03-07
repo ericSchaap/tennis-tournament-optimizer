@@ -42,6 +42,7 @@ from scheduling_constraints import (
     get_scheduling_constraints, get_rank_bracket,
     MIN_REST_DAYS, TOURNAMENTS_PER_YEAR
 )
+from travel_costs import TravelCostModel, COUNTRY_CONTINENT
 
 
 # ==============================================================================
@@ -391,25 +392,33 @@ class TournamentSimulator:
 
 class ScheduleGenerator:
     """
-    Generates random valid tournament schedules.
+    Generates random valid tournament schedules with geographic coherence.
     """
     
-    def __init__(self, tournaments_by_week, mandatory_weeks=None):
+    def __init__(self, tournaments_by_week, mandatory_weeks=None,
+                 travel_model=None):
         self.by_week = tournaments_by_week
         self.mandatory_weeks = mandatory_weeks or {}  # {week: tournament}
+        self.travel_model = travel_model
         self.all_weeks = sorted(set(
             list(self.by_week.keys()) + list(self.mandatory_weeks.keys())
         ))
     
+    def _get_continent(self, tournament):
+        """Get continent for a tournament."""
+        country = tournament.get('country', '')
+        return COUNTRY_CONTINENT.get(country, 'Unknown')
+    
     def generate(self, tournament_evs, target_tournaments=8,
-                 max_consecutive=4, rng=None):
+                 max_consecutive=4, max_continent_switches=1, rng=None):
         """
-        Generate one random valid schedule.
+        Generate one random valid schedule with geographic coherence.
         
         Args:
             tournament_evs: dict mapping tournament_name -> expected_points
             target_tournaments: desired number of tournaments
             max_consecutive: max back-to-back weeks
+            max_continent_switches: max allowed continent changes in schedule
             rng: random number generator
         
         Returns:
@@ -422,13 +431,20 @@ class ScheduleGenerator:
         consecutive = 0
         tournaments_so_far = 0
         weeks_remaining = len(self.all_weeks)
+        current_continent = None
+        continent_switches = 0
         
         for week in self.all_weeks:
             weeks_remaining -= 1
             
             # Mandatory event
             if week in self.mandatory_weeks:
-                schedule.append((week, self.mandatory_weeks[week]))
+                t = self.mandatory_weeks[week]
+                new_continent = self._get_continent(t)
+                if current_continent and new_continent != current_continent:
+                    continent_switches += 1
+                current_continent = new_continent
+                schedule.append((week, t))
                 consecutive += 1
                 tournaments_so_far += 1
                 continue
@@ -459,16 +475,50 @@ class ScheduleGenerator:
                 consecutive = 0
                 continue
             
-            # Pick a tournament (weighted by EV)
+            # Pick a tournament (weighted by EV + geographic coherence)
             options = self.by_week[week]
             weights = []
             for t in options:
                 name = t.get('tournament_name', '')
                 ev = tournament_evs.get(name, 1.0)
-                weights.append(max(0.1, ev))  # floor to avoid zero weights
+                base_weight = max(0.1, ev)
+                
+                # Geographic weighting
+                if current_continent is not None:
+                    t_continent = self._get_continent(t)
+                    t_country = t.get('country', '')
+                    
+                    if t_continent == current_continent:
+                        # Same continent: bonus for same country
+                        if self.travel_model and t_country == self.travel_model.player_country:
+                            geo_mult = 2.0  # Strong preference for home country
+                        else:
+                            geo_mult = 1.5  # Preference for same continent
+                    else:
+                        # Different continent: check if we can still switch
+                        if continent_switches >= max_continent_switches:
+                            geo_mult = 0.02  # Nearly block it (not zero for edge cases)
+                        else:
+                            geo_mult = 0.3  # Penalize but allow
+                else:
+                    # First tournament: prefer player's home continent
+                    if self.travel_model:
+                        t_continent = self._get_continent(t)
+                        if t_continent == self.travel_model.player_continent:
+                            geo_mult = 1.5
+                        else:
+                            geo_mult = 0.5
+                    else:
+                        geo_mult = 1.0
+                
+                weights.append(base_weight * geo_mult)
             
             # Weighted random selection
             total_w = sum(weights)
+            if total_w <= 0:
+                consecutive = 0
+                continue
+            
             r = rng.random() * total_w
             cumulative = 0
             chosen = options[0]
@@ -477,6 +527,12 @@ class ScheduleGenerator:
                 if r <= cumulative:
                     chosen = t
                     break
+            
+            # Track continent switches
+            new_continent = self._get_continent(chosen)
+            if current_continent and new_continent != current_continent:
+                continent_switches += 1
+            current_continent = new_continent
             
             schedule.append((week, chosen))
             consecutive += 1
@@ -495,8 +551,10 @@ class SeasonalOptimizer:
     """
     
     def __init__(self, field_data_path=None, category_fallback_path=None,
-                 name_to_key_path=None):
+                 name_to_key_path=None, player_country='FRA'):
         self.win_model = WinProbabilityModel()
+        self.player_country = player_country
+        self.travel_model = TravelCostModel(player_country=player_country)
         
         # Default paths relative to this file's location
         model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -528,6 +586,7 @@ class SeasonalOptimizer:
                  n_schedules=500, n_sims_per_tournament=1000,
                  n_sims_per_schedule=5000, target_tournaments=None,
                  surface_filter=None, exclude_tournaments=None,
+                 max_continent_switches=1,
                  seed=None, verbose=True):
         """
         Run the full optimization pipeline.
@@ -543,6 +602,7 @@ class SeasonalOptimizer:
             target_tournaments: Target number of tournaments (auto if None)
             surface_filter: List of surfaces to include (None = all)
             exclude_tournaments: Tournament names to exclude
+            max_continent_switches: Max continent changes per schedule (default 1)
             seed: Random seed for reproducibility
             verbose: Print progress
         
@@ -567,9 +627,11 @@ class SeasonalOptimizer:
             print(f"Tennis Tournament Optimizer")
             print(f"{'='*60}")
             print(f"  Player: rank {player_rank}, {player_points} points")
+            print(f"  Home country: {self.player_country} ({self.travel_model.player_continent})")
             print(f"  Window: weeks {planning_start_week}-{planning_end_week} "
                   f"({planning_end_week - planning_start_week + 1} weeks)")
             print(f"  Target: {target_tournaments} tournaments")
+            print(f"  Max continent switches: {max_continent_switches}")
             print(f"  Schedules to generate: {n_schedules}")
             print(f"  Sims per schedule: {n_sims_per_schedule}")
         
@@ -642,13 +704,15 @@ class SeasonalOptimizer:
             print(f"\n[Step 3] Generating {n_schedules} candidate schedules...")
         
         t0 = time.time()
-        generator = ScheduleGenerator(by_week, mandatory_weeks)
+        generator = ScheduleGenerator(by_week, mandatory_weeks,
+                                      travel_model=self.travel_model)
         
         candidates = []
         for i in range(n_schedules):
             rng = random.Random(seed + i if seed else None)
             schedule = generator.generate(
-                tournament_evs, target_tournaments=target_tournaments, rng=rng)
+                tournament_evs, target_tournaments=target_tournaments,
+                max_continent_switches=max_continent_switches, rng=rng)
             if len(schedule) >= 2:  # At least 2 tournaments
                 candidates.append(schedule)
         
@@ -733,7 +797,14 @@ class SeasonalOptimizer:
                 'expected_final_rank': float(np.mean(sim_final_ranks)),
                 'final_rank_p20': float(np.percentile(sim_final_ranks, 20)),
                 'final_rank_p80': float(np.percentile(sim_final_ranks, 80)),
+                'travel_info': self.travel_model.get_schedule_travel_info(schedule),
             })
+            # Compute net ROI
+            sr = schedule_results[-1]
+            sr['travel_cost'] = sr['travel_info']['total_cost']
+            sr['net_prize'] = sr['expected_prize'] - sr['travel_cost']
+            # Combined score: points are primary, net_prize breaks ties
+            sr['combined_score'] = sr['expected_points'] + sr['net_prize'] / 500.0
         
         if verbose:
             print(f"  Done ({time.time()-t0:.1f}s)")
@@ -744,8 +815,8 @@ class SeasonalOptimizer:
         if verbose:
             print(f"\n[Step 5] Ranking schedules...")
         
-        # Sort by expected points (descending)
-        schedule_results.sort(key=lambda x: -x['expected_points'])
+        # Sort by combined score (points + net ROI)
+        schedule_results.sort(key=lambda x: -x['combined_score'])
         
         # Select top diverse schedules
         top_schedules = self._select_diverse_top(schedule_results, n_top=5)
@@ -762,6 +833,9 @@ class SeasonalOptimizer:
                 print(f"  Expected points: {sched['expected_points']:.1f} "
                       f"(range: {sched['points_p20']:.0f} - {sched['points_p80']:.0f})")
                 print(f"  Expected prize:  ${sched['expected_prize']:,.0f}")
+                print(f"  Travel cost:     ${sched['travel_cost']:,.0f}  "
+                      f"({sched['travel_info']['tier_breakdown']})")
+                print(f"  Net prize (ROI): ${sched['net_prize']:,.0f}")
                 print(f"  Expected rank:   {sched['expected_final_rank']:.0f} "
                       f"(range: {sched['final_rank_p80']:.0f} - {sched['final_rank_p20']:.0f})")
                 print(f"  Tournaments ({sched['n_tournaments']}):")
@@ -770,9 +844,10 @@ class SeasonalOptimizer:
                     name = tournament.get('tournament_name', '?')
                     cat = tournament.get('category', '?')
                     surf = tournament.get('surface', '?')
+                    country = tournament.get('country', '?')
                     ev = tournament_evs.get(name, 0)
-                    print(f"    Week {week:>2d}: {name:<30s} "
-                          f"{cat:<15s} {surf:<12s} EV={ev:.1f}")
+                    print(f"    Week {week:>2d}: {name:<35s} "
+                          f"{cat:<15s} {surf:<8s} {country:<4s} EV={ev:.1f}")
         
         return {
             'top_schedules': top_schedules,
@@ -782,7 +857,9 @@ class SeasonalOptimizer:
             'metadata': {
                 'player_rank': player_rank,
                 'player_points': player_points,
+                'player_country': self.player_country,
                 'planning_window': (planning_start_week, planning_end_week),
+                'max_continent_switches': max_continent_switches,
                 'n_eligible': len(eligible),
                 'n_schedules_generated': len(candidates),
                 'n_sims_per_schedule': n_sims_per_schedule,
@@ -839,33 +916,33 @@ if __name__ == '__main__':
     
     # Real-ish clay season tournaments
     clay_season = [
-        # Week, Name, Category, Surface, Median field rank
-        (14, "Challenger Marbella", "Challenger 80", "Clay", 280),
-        (14, "M25 Antalya", "M25", "Clay", 450),
-        (15, "Challenger Bordeaux", "Challenger 100", "Clay", 250),
-        (15, "M25 Monastir I", "M25", "Clay", 500),
-        (16, "Challenger Aix-en-Provence", "Challenger 125", "Clay", 220),
-        (16, "M25 Santa Margherita", "M25", "Clay", 480),
-        (17, "Barcelona Open", "ATP 500", "Clay", 60),
-        (17, "Challenger Francavilla", "Challenger 80", "Clay", 300),
-        (17, "M25 Monastir II", "M25", "Clay", 500),
-        (18, "Madrid Open", "ATP 1000", "Clay", 40),
-        (18, "Challenger Ostrava", "Challenger 100", "Clay", 270),
-        (19, "Challenger Lyon", "Challenger 100", "Clay", 240),
-        (19, "M25 Tunis", "M25", "Clay", 450),
-        (20, "Rome Masters", "ATP 1000", "Clay", 35),
-        (20, "Challenger Prague", "Challenger 80", "Clay", 290),
-        (21, "Challenger Geneva", "Challenger 100", "Clay", 250),
-        (21, "M25 Koper", "M25", "Clay", 470),
-        (22, "Roland Garros Qualifying", "Grand Slam (Men's)", "Clay", 150),
-        (22, "Challenger Heilbronn", "Challenger 80", "Clay", 300),
-        (23, "Challenger Parma", "Challenger 100", "Clay", 260),
-        (23, "M25 Madrid", "M25", "Clay", 500),
-        (24, "Challenger Prostejov", "Challenger 80", "Clay", 290),
-        (24, "M25 Hammamet", "M25", "Clay", 480),
+        # Week, Name, Category, Surface, Median field rank, Country
+        (14, "Challenger Marbella", "Challenger 80", "Clay", 280, "ESP"),
+        (14, "M25 Antalya", "M25", "Clay", 450, "TUR"),
+        (15, "Challenger Bordeaux", "Challenger 100", "Clay", 250, "FRA"),
+        (15, "M25 Monastir I", "M25", "Clay", 500, "TUN"),
+        (16, "Challenger Aix-en-Provence", "Challenger 125", "Clay", 220, "FRA"),
+        (16, "M25 Santa Margherita", "M25", "Clay", 480, "ITA"),
+        (17, "Barcelona Open", "ATP 500", "Clay", 60, "ESP"),
+        (17, "Challenger Francavilla", "Challenger 80", "Clay", 300, "ITA"),
+        (17, "M25 Monastir II", "M25", "Clay", 500, "TUN"),
+        (18, "Madrid Open", "ATP 1000", "Clay", 40, "ESP"),
+        (18, "Challenger Ostrava", "Challenger 100", "Clay", 270, "CZE"),
+        (19, "Challenger Lyon", "Challenger 100", "Clay", 240, "FRA"),
+        (19, "M25 Tunis", "M25", "Clay", 450, "TUN"),
+        (20, "Rome Masters", "ATP 1000", "Clay", 35, "ITA"),
+        (20, "Challenger Prague", "Challenger 80", "Clay", 290, "CZE"),
+        (21, "Challenger Geneva", "Challenger 100", "Clay", 250, "SUI"),
+        (21, "M25 Koper", "M25", "Clay", 470, "SLO"),
+        (22, "Roland Garros Qualifying", "Grand Slam (Men's)", "Clay", 150, "FRA"),
+        (22, "Challenger Heilbronn", "Challenger 80", "Clay", 300, "GER"),
+        (23, "Challenger Parma", "Challenger 100", "Clay", 260, "ITA"),
+        (23, "M25 Madrid", "M25", "Clay", 500, "ESP"),
+        (24, "Challenger Prostejov", "Challenger 80", "Clay", 290, "CZE"),
+        (24, "M25 Hammamet", "M25", "Clay", 480, "TUN"),
     ]
     
-    for week, name, category, surface, median_rank in clay_season:
+    for week, name, category, surface, median_rank, country in clay_season:
         tier_group = CATEGORY_TO_TIER.get(category, 'Challenger')
         tournaments.append({
             'tournament_name': name,
@@ -879,11 +956,11 @@ if __name__ == '__main__':
             'draw_size': 128 if 'Grand Slam' in category else 32,
             'mandatory': 'ranking' if 'Grand Slam' in category else 'optional',
             'location': name.split()[-1],
-            'country': 'EUR',
+            'country': country,
         })
     
     # Run optimizer
-    optimizer = SeasonalOptimizer()
+    optimizer = SeasonalOptimizer(player_country='FRA')
     optimizer.load_synthetic_calendar(tournaments)
     
     results = optimizer.optimize(
