@@ -407,6 +407,8 @@ class ScheduleGenerator:
     def _get_continent(self, tournament):
         """Get continent for a tournament."""
         country = tournament.get('country', '')
+        if not isinstance(country, str):
+            country = ''
         return COUNTRY_CONTINENT.get(country, 'Unknown')
     
     def generate(self, tournament_evs, target_tournaments=8,
@@ -486,10 +488,12 @@ class ScheduleGenerator:
                 # Geographic weighting
                 if current_continent is not None:
                     t_continent = self._get_continent(t)
-                    t_country = t.get('country', '')
                     
                     if t_continent == current_continent:
                         # Same continent: bonus for same country
+                        t_country = t.get('country', '')
+                        if not isinstance(t_country, str):
+                            t_country = ''
                         if self.travel_model and t_country == self.travel_model.player_country:
                             geo_mult = 2.0  # Strong preference for home country
                         else:
@@ -665,14 +669,16 @@ class SeasonalOptimizer:
             return {"error": "No eligible tournaments in window"}
         
         # =====================================================================
-        # STEP 2: Compute per-tournament EV
+        # STEP 2: Compute per-tournament EV (adjusted for acceptance probability)
         # =====================================================================
         if verbose:
             print(f"\n[Step 2] Computing per-tournament EV "
                   f"({n_sims_per_tournament} sims each)...")
         
         t0 = time.time()
-        tournament_evs = {}
+        tournament_evs = {}       # Effective EV (raw × acceptance prob)
+        tournament_raw_evs = {}   # Raw EV (if accepted)
+        tournament_accept = {}    # Acceptance probability
         tournament_details = {}
         
         for t in eligible:
@@ -682,20 +688,30 @@ class SeasonalOptimizer:
             
             ev = self.simulator.estimate_ev(
                 player_rank, t, n_sims=n_sims_per_tournament)
-            tournament_evs[name] = ev['expected_points']
+            
+            category = t.get('category', '')
+            accept_prob = self.mapper.acceptance_probability(player_rank, category)
+            
+            tournament_raw_evs[name] = ev['expected_points']
+            tournament_accept[name] = accept_prob
+            tournament_evs[name] = ev['expected_points'] * accept_prob
             tournament_details[name] = ev
+            tournament_details[name]['acceptance_probability'] = accept_prob
         
         if verbose:
             print(f"  {len(tournament_evs)} tournaments evaluated "
                   f"({time.time()-t0:.1f}s)")
             
-            # Show top 10
+            # Show top 10 by effective EV
             sorted_evs = sorted(tournament_evs.items(), key=lambda x: -x[1])
-            print(f"\n  Top 10 by expected points:")
-            for name, ev in sorted_evs[:10]:
+            print(f"\n  Top 10 by effective EV (raw × acceptance):")
+            for name, eff_ev in sorted_evs[:10]:
                 t_info = next(t for t in eligible if t.get('tournament_name') == name)
-                print(f"    {name:<35s} EV={ev:>5.1f} pts  "
-                      f"({t_info.get('surface','?')}, {t_info.get('category','?')})")
+                raw = tournament_raw_evs[name]
+                acc = tournament_accept[name]
+                print(f"    {name:<35s} EV={eff_ev:>5.1f} "
+                      f"(raw={raw:.1f} × {acc:.0%} accept)  "
+                      f"{t_info.get('category','?')}")
         
         # =====================================================================
         # STEP 3: Generate candidate schedules
@@ -769,6 +785,16 @@ class SeasonalOptimizer:
                     else:
                         points_expiring = 0
                     last_week = week
+                    
+                    # Check acceptance: randomly determine if player gets in
+                    t_name = tournament.get('tournament_name', '')
+                    accept_prob = tournament_accept.get(t_name, 1.0)
+                    if accept_prob < 1.0 and rng.random() > accept_prob:
+                        # Not accepted — points still expire, but no play
+                        current_points = current_points - points_expiring
+                        current_points = max(0, current_points)
+                        current_rank = self.mapper.points_to_rank(current_points)
+                        continue
                     
                     result = self.simulator.simulate_once(
                         current_rank, tournament, rng)
@@ -846,13 +872,17 @@ class SeasonalOptimizer:
                     surf = tournament.get('surface', '?')
                     country = tournament.get('country', '?')
                     ev = tournament_evs.get(name, 0)
+                    acc = tournament_accept.get(name, 1.0)
+                    acc_str = f'{acc:.0%}' if acc < 1.0 else '100%'
                     print(f"    Week {week:>2d}: {name:<35s} "
-                          f"{cat:<15s} {surf:<8s} {country:<4s} EV={ev:.1f}")
+                          f"{cat:<15s} {surf:<8s} {country:<4s} EV={ev:.1f} ({acc_str})")
         
         return {
             'top_schedules': top_schedules,
             'all_results': schedule_results[:20],  # Top 20 for reference
             'tournament_evs': tournament_evs,
+            'tournament_raw_evs': tournament_raw_evs,
+            'tournament_accept': tournament_accept,
             'tournament_details': tournament_details,
             'metadata': {
                 'player_rank': player_rank,

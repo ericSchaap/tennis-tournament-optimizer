@@ -111,6 +111,8 @@ class TravelCostModel:
         """
         Determine travel tier: national, international, or intercontinental.
         """
+        if not tournament_country or not isinstance(tournament_country, str):
+            return 'international'  # Default for missing data
         tournament_country = tournament_country.upper()
         
         # Same country
@@ -134,6 +136,8 @@ class TravelCostModel:
         """
         Estimate total trip cost in USD.
         """
+        if not tournament_country or not isinstance(tournament_country, str):
+            tournament_country = 'UNK'
         tier = self.get_tier(tournament_country)
         base_cost = TRAVEL_COSTS[tier]
         
@@ -161,6 +165,8 @@ class TravelCostModel:
         
         for week, tournament in schedule:
             tourn_country = tournament.get('country', 'UNK')
+            if not isinstance(tourn_country, str):
+                tourn_country = 'UNK'
             tier = self.get_tier(tourn_country)
             cost = self.estimate_cost(tourn_country)
             

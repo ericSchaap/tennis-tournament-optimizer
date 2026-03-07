@@ -58,9 +58,10 @@ RANK_POINTS_TABLE = {
     2000: 1.0,
 }
 
-# Entry thresholds: realistic ranking needed for reliable entry
-# Based on P95 of actual entrant ranks (2022-2025)
-# These represent "what rank gets you in ~95% of the time"
+# Entry thresholds: data-driven from first-round entrant analysis (2022-2025)
+# reliable_rank = P75 of first-round entrants (rank that reliably gets DA)
+# cutoff_rank = P95 of first-round entrants (rank where entry becomes very unlikely)
+# Between reliable and cutoff: acceptance probability declines linearly
 ENTRY_THRESHOLDS = {
     "Grand Slam": 104,              # Main draw direct acceptance
     "Grand Slam Qualifying": 250,    # Qualifying entry
@@ -75,6 +76,34 @@ ENTRY_THRESHOLDS = {
     "Challenger 50": 900,
     "Challenger": 700,               # Generic Challenger
     "ITF": 2000,                     # Essentially open entry
+}
+
+# Data-driven acceptance curves from first-round entrant analysis (2022-2025)
+# Format: (reliable_rank, cutoff_rank)
+# reliable_rank (P75): rank that reliably gets direct acceptance (~100%)
+# cutoff_rank (P95): rank beyond which entry is very unlikely (<5%)
+ACCEPTANCE_CURVES = {
+    "Grand Slam (Men's)":   (97, 200),
+    "Grand Slam (Women's)": (97, 200),
+    "ATP 1000":             (77, 160),
+    "WTA 1000":             (77, 160),
+    "WTA 1000 (5)":         (77, 160),
+    "ATP 500":              (87, 227),
+    "WTA 500":              (87, 227),
+    "ATP 250":              (125, 303),
+    "WTA 250":              (125, 303),
+    "WTA 125":              (200, 400),
+    "Challenger 175":       (166, 333),
+    "Challenger 125":       (294, 553),
+    "Challenger 110":       (310, 600),
+    "Challenger 100":       (336, 642),
+    "Challenger 90":        (350, 680),
+    "Challenger 80":        (366, 721),
+    "Challenger 75":        (400, 779),
+    "Challenger 50":        (536, 971),
+    "Challengers":          (400, 700),
+    "M25":                  (1500, 2500),
+    "M15":                  (1800, 3000),
 }
 
 
@@ -146,45 +175,51 @@ class PointsRankMapper:
         
         return self._ranks_by_pts[-1]
     
-    def can_enter(self, rank, category):
-        """Check if a player with given rank can enter a tournament category."""
+    def acceptance_probability(self, rank, category):
+        """
+        Return the probability (0-1) that a player with given rank
+        gets accepted into a tournament of this category.
+        
+        Uses data-driven curves from first-round entrant analysis.
+        Between reliable_rank and cutoff_rank: linear decline from 1.0 to 0.05.
+        """
         cat = category.strip()
         
-        # Explicit mapping from Coretennis category names to thresholds
-        CATEGORY_THRESHOLDS = {
-            "Grand Slam (Men's)": 104,
-            "Grand Slam (Women's)": 104,
-            "ATP 1000": 100,
-            "WTA 1000": 100,
-            "WTA 1000 (5)": 100,
-            "ATP 500": 100,
-            "WTA 500": 100,
-            "ATP 250": 150,
-            "WTA 250": 150,
-            "WTA 125": 200,
-            "ATP Finals": 8,
-            "Year End Championships": 8,
-        }
-        
-        # Check explicit mapping first
-        if cat in CATEGORY_THRESHOLDS:
-            return rank <= CATEGORY_THRESHOLDS[cat]
-        
-        # Challenger tiers
-        if 'Challenger' in cat:
+        # Try exact match first
+        if cat in ACCEPTANCE_CURVES:
+            reliable, cutoff = ACCEPTANCE_CURVES[cat]
+        elif 'Challenger' in cat:
+            # Match by prize level
             for level_str in ['175', '125', '110', '100', '90', '80', '75', '50']:
-                if level_str in cat:
-                    threshold = ENTRY_THRESHOLDS.get(f'Challenger {level_str}', 700)
-                    return rank <= threshold
-            return rank <= 700  # Default Challenger
+                key = f'Challenger {level_str}'
+                if level_str in cat and key in ACCEPTANCE_CURVES:
+                    reliable, cutoff = ACCEPTANCE_CURVES[key]
+                    break
+            else:
+                reliable, cutoff = ACCEPTANCE_CURVES.get('Challengers', (400, 700))
+        elif cat in ('M25', 'M15') or cat.startswith('W'):
+            reliable, cutoff = ACCEPTANCE_CURVES.get(cat, (1500, 2500))
+        elif 'ATP Finals' in cat or 'Year End' in cat:
+            return 1.0 if rank <= 8 else 0.0
+        else:
+            # Unknown category — default permissive
+            return 1.0 if rank <= 2000 else 0.0
         
-        # ITF
-        if cat in ('M25', 'M15') or cat.startswith('W'):
-            return rank <= 2000
-        
-        # Default: check ENTRY_THRESHOLDS with fuzzy match
-        threshold = ENTRY_THRESHOLDS.get(cat, 2000)
-        return rank <= threshold
+        if rank <= reliable:
+            return 1.0
+        elif rank >= cutoff:
+            return 0.05  # Wild card / alternate chance
+        else:
+            # Linear decline
+            return 1.0 - 0.95 * (rank - reliable) / (cutoff - reliable)
+    
+    def can_enter(self, rank, category, min_probability=0.15):
+        """
+        Check if a player with given rank can realistically enter a
+        tournament category. Returns True if acceptance probability
+        exceeds min_probability (default 15%).
+        """
+        return self.acceptance_probability(rank, category) >= min_probability
     
     def simulate_ranking_change(self, current_rank, current_points, points_gained,
                                 points_expiring=0):
