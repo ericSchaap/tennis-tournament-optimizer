@@ -308,6 +308,9 @@ class TournamentSimulator:
         """
         Simulate one run through a tournament bracket with realistic seeded draw.
         
+        Each simulation perturbs the base field by ±15% per opponent to capture
+        week-to-week variation in field strength.
+        
         Returns:
             dict with round_reached, points_earned, prize_earned
         """
@@ -319,8 +322,13 @@ class TournamentSimulator:
         tier_group = CATEGORY_TO_TIER.get(category, tournament.get('tier_name', 'Challenger'))
         draw_size = tournament.get('draw_size', 32)
         
-        # Use pre-generated field
-        field = self._generate_field(tournament, draw_size)
+        # Get base field and apply per-sim noise
+        base_field = self._generate_field(tournament, draw_size)
+        field = []
+        for rank in base_field:
+            noise = rng.gauss(0, rank * 0.15)  # ±15% standard deviation
+            field.append(max(1, int(rank + noise)))
+        field.sort()
         
         # Determine round structure
         if draw_size >= 128:
@@ -385,27 +393,45 @@ class TournamentSimulator:
         Estimate expected value for a single tournament.
         
         Returns:
-            dict with expected_points, expected_prize, round_probabilities
+            dict with expected_points, expected_prize, round_probabilities,
+            and confidence intervals (p10, p25, p50, p75, p90)
         """
         rng = random.Random(seed)
         
-        total_points = 0.0
-        total_prize = 0.0
+        sim_points = []
+        sim_prizes = []
         round_counts = {}
         
         for _ in range(n_sims):
             result = self.simulate_once(player_rank, tournament, rng)
-            total_points += result['points_earned']
-            total_prize += result['prize_earned']
+            sim_points.append(result['points_earned'])
+            sim_prizes.append(result['prize_earned'])
             
             r = result['round_reached']
             round_counts[r] = round_counts.get(r, 0) + 1
         
         round_probs = {r: c / n_sims for r, c in sorted(round_counts.items())}
         
+        pts = np.array(sim_points)
+        prz = np.array(sim_prizes)
+        
         return {
-            'expected_points': round(total_points / n_sims, 2),
-            'expected_prize': round(total_prize / n_sims, 2),
+            'expected_points': round(float(pts.mean()), 2),
+            'expected_prize': round(float(prz.mean()), 2),
+            'points_ci': {
+                'p10': round(float(np.percentile(pts, 10)), 1),
+                'p25': round(float(np.percentile(pts, 25)), 1),
+                'p50': round(float(np.median(pts)), 1),
+                'p75': round(float(np.percentile(pts, 75)), 1),
+                'p90': round(float(np.percentile(pts, 90)), 1),
+            },
+            'prize_ci': {
+                'p10': round(float(np.percentile(prz, 10)), 0),
+                'p25': round(float(np.percentile(prz, 25)), 0),
+                'p50': round(float(np.median(prz)), 0),
+                'p75': round(float(np.percentile(prz, 75)), 0),
+                'p90': round(float(np.percentile(prz, 90)), 0),
+            },
             'round_probs': round_probs,
             'n_sims': n_sims,
         }
@@ -758,8 +784,10 @@ class SeasonalOptimizer:
                 t_info = next(t for t in eligible if t.get('tournament_name') == name)
                 raw = tournament_raw_evs[name]
                 acc = tournament_accept[name]
-                print(f"    {name:<35s} EV={eff_ev:>5.1f} "
-                      f"(raw={raw:.1f} × {acc:.0%} accept)  "
+                ci = tournament_details[name].get('points_ci', {})
+                ci_str = f" [{ci.get('p25',0):.0f}-{ci.get('p75',0):.0f}]" if ci else ""
+                print(f"    {name:<35s} EV={eff_ev:>5.1f}{ci_str} "
+                      f"(raw={raw:.1f} × {acc:.0%})  "
                       f"{t_info.get('category','?')}")
         
         # =====================================================================
@@ -875,13 +903,19 @@ class SeasonalOptimizer:
                 'tournaments': [t.get('tournament_name', '?') for _, t in schedule],
                 'n_tournaments': len(schedule),
                 'expected_points': float(np.mean(sim_points)),
+                'points_p10': float(np.percentile(sim_points, 10)),
                 'points_p20': float(np.percentile(sim_points, 20)),
                 'points_p50': float(np.median(sim_points)),
                 'points_p80': float(np.percentile(sim_points, 80)),
+                'points_p90': float(np.percentile(sim_points, 90)),
                 'expected_prize': float(np.mean(sim_prizes)),
+                'prize_p10': float(np.percentile(sim_prizes, 10)),
+                'prize_p90': float(np.percentile(sim_prizes, 90)),
                 'expected_final_rank': float(np.mean(sim_final_ranks)),
+                'final_rank_p10': float(np.percentile(sim_final_ranks, 10)),
                 'final_rank_p20': float(np.percentile(sim_final_ranks, 20)),
                 'final_rank_p80': float(np.percentile(sim_final_ranks, 80)),
+                'final_rank_p90': float(np.percentile(sim_final_ranks, 90)),
                 'travel_info': self.travel_model.get_schedule_travel_info(schedule),
             })
             # Compute net ROI
@@ -915,14 +949,16 @@ class SeasonalOptimizer:
             
             for i, sched in enumerate(top_schedules):
                 print(f"\n--- Schedule {i+1} ---")
-                print(f"  Expected points: {sched['expected_points']:.1f} "
-                      f"(range: {sched['points_p20']:.0f} - {sched['points_p80']:.0f})")
-                print(f"  Expected prize:  ${sched['expected_prize']:,.0f}")
-                print(f"  Travel cost:     ${sched['travel_cost']:,.0f}  "
+                print(f"  Points:  {sched['expected_points']:>5.1f}  "
+                      f"80% CI [{sched['points_p10']:.0f} - {sched['points_p90']:.0f}]  "
+                      f"median {sched['points_p50']:.0f}")
+                print(f"  Prize:   ${sched['expected_prize']:>7,.0f}  "
+                      f"80% CI [${sched['prize_p10']:,.0f} - ${sched['prize_p90']:,.0f}]")
+                print(f"  Travel:  ${sched['travel_cost']:>7,.0f}  "
                       f"({sched['travel_info']['tier_breakdown']})")
-                print(f"  Net prize (ROI): ${sched['net_prize']:,.0f}")
-                print(f"  Expected rank:   {sched['expected_final_rank']:.0f} "
-                      f"(range: {sched['final_rank_p80']:.0f} - {sched['final_rank_p20']:.0f})")
+                print(f"  Net ROI: ${sched['net_prize']:>7,.0f}")
+                print(f"  Rank:    {sched['expected_final_rank']:>5.0f}  "
+                      f"80% CI [{sched['final_rank_p90']:.0f} - {sched['final_rank_p10']:.0f}]")
                 print(f"  Tournaments ({sched['n_tournaments']}):")
                 
                 for week, tournament in sched['schedule']:
