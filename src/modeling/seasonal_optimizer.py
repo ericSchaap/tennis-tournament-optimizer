@@ -984,6 +984,10 @@ class SeasonalOptimizer:
                 'final_rank_p80': float(np.percentile(sim_final_ranks, 80)),
                 'final_rank_p90': float(np.percentile(sim_final_ranks, 90)),
                 'travel_info': self.travel_model.get_schedule_travel_info(schedule),
+                # Raw arrays for visualization (boxplots etc.)
+                'sim_points_raw': list(sim_points),
+                'sim_prizes_raw': list(sim_prizes),
+                'sim_ranks_raw': list(sim_final_ranks),
             })
             # Compute full costs (travel + entry fees + accommodation)
             sr = schedule_results[-1]
